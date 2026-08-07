@@ -75,6 +75,7 @@ expected hole: 64x52 natural px
 gap_left = 184
 gap left: 184 natural px -> drag distance 127.3 px
 dragged slider 128.0 px
+verification succeeded: 验证成功
 ```
 
 Runtime captures are written to `saved_img/` for inspection. This directory is ignored by Git. The background filename is overwritten on each run, while DrissionPage may suffix subsequent piece filenames.
@@ -88,8 +89,10 @@ flowchart LR
     C --> D[Measure rendered geometry]
     D --> E[OpenCV detection]
     E --> F[Convert canvas x to screen distance]
-    F --> G[Press and drag real handle]
-    G --> H[Verify DOM displacement]
+    F --> G[Arm result observer]
+    G --> H[Press and drag real handle]
+    H --> I[Verify DOM displacement]
+    I --> J[Wait for SDK terminal state]
 ```
 
 The project is intentionally small:
@@ -98,10 +101,12 @@ The project is intentionally small:
 | --- | --- |
 | `slide-verification.py` | Browser orchestration, DOM lookup, capture, scale conversion, and error reporting |
 | `gap_detect.py` | Piece geometry, OpenCV detection, candidate selection, and verified drag motion |
+| `verification_detect.py` | Page-side result observer, terminal-state normalization, polling, and timeout handling |
 | `test_gap.py` | Synthetic detector and drag regressions that do not access the live site |
+| `test_verification.py` | Offline success, rejection, load-error, reset, and timeout regressions |
 | `pyproject.toml` / `uv.lock` | Python metadata and reproducible dependencies |
 
-`slide-verification.py` owns site-specific selectors. `gap_detect.py` contains the reusable computation and accepts image paths plus expected natural dimensions. Keeping these responsibilities separate allows detection tests to run without Chromium or network access.
+`slide-verification.py` owns site-specific orchestration. `gap_detect.py` contains the reusable image and motion computation, while `verification_detect.py` isolates post-drag browser state. Keeping these responsibilities separate allows nearly all behavior to be tested without Chromium or network access.
 
 ## Detection Strategy
 
@@ -212,6 +217,21 @@ The floating puzzle image is not the SDK's drag target. The script presses the i
 
 The displacement check distinguishes a completed drag from a panel closed by a physical mouse event.
 
+## Success Detection Strategy
+
+Moving the handle to the requested coordinate only proves that the input was delivered. It does not prove that DingXiang accepted the attempt. The SDK submits behavior and challenge data to its verification service after mouse-up, then renders a terminal state.
+
+Immediately before dragging, `arm_verification_detection()` installs a `MutationObserver` on the current CAPTCHA trigger. It watches class, style, child, and text changes and samples:
+
+- The basic challenge bar and the outer one-click bar for `dx-success`
+- The failure bar or `dx-fail`/`dx-error` state
+- The load-error message separately from a rejected attempt
+- The visible localized message, such as `验证成功` or `验证未通过`
+
+The observer retains the first terminal snapshot. This matters because a rejected challenge can refresh quickly; ordinary Python polling could otherwise see only the subsequent neutral state. After the drag, Python polls the retained state every 50 ms for up to 10 seconds and returns one of `success`, `failure`, or `load_error`. A missing terminal transition raises `VerificationTimeoutError`, and the page-side observer is disconnected on every exit path.
+
+This rendered-state approach is specific to automating the public demo. In an application that initializes its own DingXiang CAPTCHA instance, prefer the SDK's official `verifySuccess` and `verifyFail` events and consume the success token.
+
 ## Public API
 
 The reusable functions live in `gap_detect.py`:
@@ -247,18 +267,40 @@ Returns the natural-canvas alignment x-coordinate as an integer. It raises `GapN
 
 Drags the supplied DrissionPage handle and returns its measured horizontal displacement. Invalid distances raise `ValueError`; interrupted or overridden drags raise `RuntimeError`.
 
+The post-drag API lives in `verification_detect.py`:
+
+```python
+from verification_detect import (
+    VerificationStatus,
+    arm_verification_detection,
+    wait_for_verification_result,
+)
+
+initial = arm_verification_detection(captcha_root)
+assert initial.status is VerificationStatus.PENDING
+
+# Perform the drag here.
+result = wait_for_verification_result(captcha_root, timeout=10)
+if result.status is VerificationStatus.SUCCESS:
+    print(result.message)
+```
+
+The observer must be armed before mouse-up so brief rejection states are retained. `wait_for_verification_result()` disconnects it after a terminal result or timeout.
+
 ## Testing
 
-Run the complete offline regression script:
+Run both offline regression scripts:
 
 ```bash
 uv run ./test_gap.py
+uv run ./test_verification.py
 ```
 
 On Windows, this form is equivalent:
 
 ```powershell
 uv run .\test_gap.py
+uv run .\test_verification.py
 ```
 
 The suite covers:
@@ -271,11 +313,15 @@ The suite covers:
 - A slot close to a canvas boundary
 - Undecodable input and an empty alpha mask
 - Exact drag target, displacement, release, and zero final vertical drift
+- Success and failure UI states
+- CAPTCHA load errors
+- Retention of a brief failure across an automatic widget reset
+- Result polling, timeout, and observer cleanup
 
 Compile-check the modules with:
 
 ```bash
-uv run python -m compileall -q gap_detect.py slide-verification.py test_gap.py
+uv run python -m compileall -q gap_detect.py verification_detect.py slide-verification.py test_gap.py test_verification.py
 ```
 
 On the development machine, the OpenCV detector has a warmed median around 18 ms for a 400×200 challenge, compared with roughly 1.5–2.1 seconds for the previous Python sliding-window implementation. Timings vary by hardware and image contents.
@@ -286,6 +332,9 @@ On the development machine, the OpenCV detector has a warmed median around 18 ms
 | --- | --- | --- |
 | CAPTCHA panel disappears | Physical mouse entered or left the hover-driven panel | Keep the pointer outside the browser tab and retry |
 | `slider did not follow the automated pointer` | Real input overrode DrissionPage or the panel closed | Do not move the mouse; rerun after the page settles |
+| `not solved: failure` | The service rejected the submitted position or behavior | Retry with a fresh challenge; inspect the detected distance if failures repeat |
+| `CAPTCHA did not report success or failure` | The SDK never rendered a terminal state within 10 seconds | Check network requests and inspect whether DingXiang changed its result classes |
+| `not solved: load_error` | The CAPTCHA SDK could not load or verify the challenge | Check connectivity, rate limits, and the demo service status |
 | `no matching piece contour found` | Weak/unsupported visual variant or incorrect dimensions | Inspect the latest files in `saved_img/` and verify the canvas/piece constants |
 | `no closed background contour matches the piece` | Slot edge is fragmented or site styling changed | Review Canny/morphology thresholds and the captured image |
 | Wrong object is selected | A new decoy passes both shape filters and is darker | Add the capture as a regression and adjust shape qualification before brightness logic |
@@ -299,6 +348,8 @@ The most important invariants are declared as named constants near the top of `g
 1. Preserve the ordering: template match, contour match, then brightness.
 2. Add or generate a regression case before changing a threshold.
 3. Benchmark after changes; avoid reintroducing per-pixel Python loops.
+
+When DingXiang changes its rendered DOM, update the selectors and state classes in the page-side observer together with `test_verification.py`. If this code is adapted to a site where the CAPTCHA instance is available, replace DOM observation with the official SDK result events.
 4. Keep natural-canvas coordinates separate from rendered screen coordinates.
 5. Revalidate live selectors whenever the demo SDK changes.
 

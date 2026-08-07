@@ -75,6 +75,7 @@ expected hole: 64x52 natural px
 gap_left = 184
 gap left: 184 natural px -> drag distance 127.3 px
 dragged slider 128.0 px
+verification succeeded: 验证成功
 ```
 
 运行时截图保存在 `saved_img/` 目录中，便于排查问题。该目录已被 Git 忽略。背景文件每次运行都会覆盖，DrissionPage 可能会为后续拼图文件自动添加编号后缀。
@@ -88,8 +89,10 @@ flowchart LR
     C --> D[测量渲染几何信息]
     D --> E[OpenCV 检测]
     E --> F[将画布 x 坐标换算为屏幕距离]
-    F --> G[按住并拖动真正手柄]
-    G --> H[校验 DOM 实际位移]
+    F --> G[启动结果观察器]
+    G --> H[按住并拖动真正手柄]
+    H --> I[校验 DOM 实际位移]
+    I --> J[等待 SDK 终态]
 ```
 
 项目结构刻意保持精简：
@@ -98,10 +101,12 @@ flowchart LR
 | --- | --- |
 | `slide-verification.py` | 浏览器编排、DOM 查询、截图、缩放换算和错误输出 |
 | `gap_detect.py` | 拼图几何计算、OpenCV 检测、候选选择和经校验的拖动动作 |
+| `verification_detect.py` | 页面结果观察、终态归一化、轮询和超时处理 |
 | `test_gap.py` | 不访问真实网站的合成检测与拖动回归测试 |
+| `test_verification.py` | 离线验证成功、拒绝、加载错误、重置和超时回归测试 |
 | `pyproject.toml` / `uv.lock` | Python 项目元数据和可复现依赖 |
 
-`slide-verification.py` 负责与网站结构相关的选择器；`gap_detect.py` 只接收图像路径和预期自然尺寸，包含可复用计算。这样的职责划分允许检测测试在没有 Chromium 和网络的环境中运行。
+`slide-verification.py` 负责网站相关的流程编排；`gap_detect.py` 包含可复用的图像与动作计算；`verification_detect.py` 隔离拖动后的浏览器状态判断。这样的职责划分让绝大多数行为都能在没有 Chromium 和网络的环境中测试。
 
 ## 检测策略
 
@@ -212,6 +217,21 @@ drag_distance = gap_left_screen - piece_left_screen
 
 位移校验可以区分真正完成的拖动和被物理鼠标事件关闭的面板。
 
+## 成功检测策略
+
+手柄到达目标坐标只能证明输入动作已执行，不能证明顶象接受了本次验证。鼠标释放后，SDK 会把行为和挑战数据提交到验证服务，再渲染最终状态。
+
+拖动前，`arm_verification_detection()` 会在当前验证码触发器上安装 `MutationObserver`，监听 class、style、子节点和文本变化，并采样：
+
+- 基础挑战栏和外层一键验证栏中的 `dx-success`
+- 失败栏或 `dx-fail`/`dx-error` 状态
+- 与验证拒绝分开处理的加载错误
+- 当前可见的本地化消息，例如 `验证成功` 或 `验证未通过`
+
+观察器会保留第一个终态快照。这一点很重要，因为验证被拒后组件可能迅速刷新；仅依靠普通 Python 轮询可能只能看到刷新后的中性状态。拖动结束后，Python 每 50 毫秒读取一次保留状态，最长等待 10 秒，结果为 `success`、`failure` 或 `load_error`。没有出现终态时抛出 `VerificationTimeoutError`，且任何退出路径都会断开页面观察器。
+
+这种渲染状态方案用于自动化公开演示页。如果业务代码能够取得自己初始化的顶象验证码实例，应优先使用 SDK 官方的 `verifySuccess` 和 `verifyFail` 事件，并消费成功 token。
+
 ## 公共 API
 
 可复用函数位于 `gap_detect.py`：
@@ -247,18 +267,40 @@ gap_x = find_gap_left(
 
 拖动传入的 DrissionPage 手柄并返回测得的水平位移。无效距离抛出 `ValueError`；被中断或覆盖的拖动抛出 `RuntimeError`。
 
+拖动后状态 API 位于 `verification_detect.py`：
+
+```python
+from verification_detect import (
+    VerificationStatus,
+    arm_verification_detection,
+    wait_for_verification_result,
+)
+
+initial = arm_verification_detection(captcha_root)
+assert initial.status is VerificationStatus.PENDING
+
+# 在此执行拖动。
+result = wait_for_verification_result(captcha_root, timeout=10)
+if result.status is VerificationStatus.SUCCESS:
+    print(result.message)
+```
+
+观察器必须在鼠标释放前启动，才能保留短暂出现的拒绝状态。`wait_for_verification_result()` 会在得到终态或超时后断开观察器。
+
 ## 测试
 
-运行完整离线回归脚本：
+运行两个离线回归脚本：
 
 ```bash
 uv run ./test_gap.py
+uv run ./test_verification.py
 ```
 
 Windows 下也可使用：
 
 ```powershell
 uv run .\test_gap.py
+uv run .\test_verification.py
 ```
 
 测试覆盖：
@@ -271,11 +313,15 @@ uv run .\test_gap.py
 - 靠近画布边界的缺口
 - 无法解码的输入和空透明遮罩
 - 正确拖动目标、精确位移、释放事件和最终零垂直漂移
+- 验证成功与失败界面状态
+- 验证码加载错误
+- 组件自动重置时对短暂失败状态的保留
+- 结果轮询、超时和观察器清理
 
 模块编译检查：
 
 ```bash
-uv run python -m compileall -q gap_detect.py slide-verification.py test_gap.py
+uv run python -m compileall -q gap_detect.py verification_detect.py slide-verification.py test_gap.py test_verification.py
 ```
 
 在开发机器上，OpenCV 检测器处理 400×200 挑战的预热中位耗时约为 18 毫秒；原 Python 滑动窗口实现约为 1.5–2.1 秒。实际耗时会随硬件和图像内容变化。
@@ -286,6 +332,9 @@ uv run python -m compileall -q gap_detect.py slide-verification.py test_gap.py
 | --- | --- | --- |
 | 验证码面板消失 | 物理鼠标进入或离开了悬停面板 | 将鼠标移出浏览器标签页后重试 |
 | `slider did not follow the automated pointer` | 真实输入覆盖了 DrissionPage，或面板被关闭 | 不要移动鼠标，待页面稳定后重新运行 |
+| `not solved: failure` | 服务端拒绝了提交的位置或行为数据 | 使用新挑战重试；若持续失败，检查检测距离 |
+| `CAPTCHA did not report success or failure` | SDK 在 10 秒内没有渲染终态 | 检查网络请求，并确认顶象是否修改了结果 class |
+| `not solved: load_error` | 验证码 SDK 无法加载或校验挑战 | 检查连接、频率限制和演示服务状态 |
 | `no matching piece contour found` | 图像变体不受支持，或尺寸计算错误 | 检查 `saved_img/` 最新文件以及画布、拼图常量 |
 | `no closed background contour matches the piece` | 缺口边缘断裂或网站样式发生变化 | 检查 Canny、形态学参数和捕获图像 |
 | 选中了错误物体 | 新干扰物同时通过形状过滤且更暗 | 先添加回归用例，再调整形状验证，不要直接修改亮度逻辑 |
@@ -299,6 +348,8 @@ uv run python -m compileall -q gap_detect.py slide-verification.py test_gap.py
 1. 保持“模板匹配 → 轮廓匹配 → 亮度排序”的顺序。
 2. 修改阈值前先新增或生成回归用例。
 3. 修改后重新基准测试，避免重新引入逐像素 Python 循环。
+
+顶象渲染 DOM 发生变化时，应同时更新页面观察器中的选择器、状态 class 和 `test_verification.py`。如果将代码适配到能够取得验证码实例的网站，应使用官方 SDK 结果事件替换 DOM 观察。
 4. 始终区分画布自然坐标和浏览器渲染坐标。
 5. 演示 SDK 更新后重新验证实时选择器。
 

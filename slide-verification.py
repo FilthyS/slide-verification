@@ -12,6 +12,13 @@ from gap_detect import (
     find_gap_left,
     piece_geometry,
 )
+from verification_detect import (
+    VerificationStatus,
+    VerificationTimeoutError,
+    arm_verification_detection,
+    stop_verification_detection,
+    wait_for_verification_result,
+)
 
 print(
     "IMPORTANT: Keep your mouse pointer outside the browser tab until the "
@@ -132,6 +139,30 @@ piece_left_screen = (
 distance = gap_left_screen - piece_left_screen
 print(f"gap left: {gap_left} natural px -> drag distance {distance:.1f} px")
 
-actual_distance = drag_slider(tab, drag_handle, distance)
+initial_result = arm_verification_detection(slider_trigger)
+if initial_result.status is not VerificationStatus.PENDING:
+    stop_verification_detection(slider_trigger)
+    raise RuntimeError(
+        "CAPTCHA had a stale terminal state before dragging: "
+        f"{initial_result.status.value}"
+    )
+
+try:
+    actual_distance = drag_slider(tab, drag_handle, distance)
+except BaseException:
+    stop_verification_detection(slider_trigger)
+    raise
 print(f"dragged slider {actual_distance:.1f} px")
+
+try:
+    verification_result = wait_for_verification_result(slider_trigger)
+except VerificationTimeoutError as exc:
+    raise SystemExit(f"not solved: {exc}") from exc
+
+if verification_result.status is not VerificationStatus.SUCCESS:
+    raise SystemExit(
+        f"not solved: {verification_result.status.value}: "
+        f"{verification_result.message}"
+    )
+print(f"verification succeeded: {verification_result.message}")
 
